@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+"""amifeed - the terminal RSS reader for Linux.
+
+The same screens and keys as the Amiga client (amiga/src/ui.c), talking to the
+same amifeed proxy (PROTOCOL.md). Python 3.8+, standard library only.
+
+Settings: $XDG_CONFIG_HOME/amifeed/client.conf (or $AMIFEED_HOME/client.conf)
+    HOST=192.168.1.10     the proxy
+    PORT=8642
+    TOKEN=...             or TOKEN_FILE=token (relative to the settings folder)
+    WIDTH=0  HEIGHT=0     0 = the size of the terminal
+Local feeds (one "url [name]" per line) and the read state of their articles
+live in the same folder, in "feeds" and "seen".
+"""
+import http.client
+import os
+import select
+import shutil
+import sys
+import termios
+import tty
+import unicodedata
+import urllib.parse
+
+VERSION = "0.1"
+SEEN_MAX = 2000
+ART_MAX = 300
+
+C_BAR = "\x1b[0;7m"
+C_DIM = "\x1b[0;36m"
+C_ERR = "\x1b[0;1;31m"
+C_SEL = "\x1b[0;7m"
+C_OFF = "\x1b[0m"
+C_READ = "\x1b[0;36m"   # read articles, empty streams
+
+
+class Error(Exception):
+    pass
+
+
+# ---- settings and local state ----------------------------------------------
+
+def conf_dir():
+    if os.environ.get("AMIFEED_HOME"):
+        return os.environ["AMIFEED_HOME"]
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "amifeed")
+
+
+def load_config(d):
+    cfg = {"HOST": "", "PORT": "8642", "TOKEN": "", "TOKEN_FILE": "", "WIDTH": "0", "HEIGHT": "0"}
+    path = os.path.join(d, "client.conf")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and line[0] != "#" and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip().upper()] = v.strip()
+    except OSError:
+        pass
+    if not cfg["TOKEN"] and cfg["TOKEN_FILE"]:
+        try:
+            with open(os.path.join(d, os.path.expanduser(cfg["TOKEN_FILE"]))) as f:
+                cfg["TOKEN"] = f.read().strip()
+        except OSError as e:
+            sys.exit("amifeed: cannot read the token file: %s" % e)
+    if not cfg["HOST"] or not cfg["TOKEN"]:
+        sys.exit("amifeed: %s needs at least HOST= and TOKEN= (or TOKEN_FILE=)" % path)
+    return cfg
+
+
+class Store:
+    """Local feeds and which of their articles have been read."""
+
+    def __init__(self, d):
+        self.d = d
+        self.feeds = []
+        self.seen = {}          # an ordered set: the oldest entries are dropped
+        self.dirty = False
+        try:
+            with open(os.path.join(d, "feeds"), encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and line[0] != "#":
+                        url, _, name = line.partition(" ")
+                        self.feeds.append((url, name.strip() or url))
+        except OSError:
+            pass
+        try:
+            with open(os.path.join(d, "seen"), encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        self.seen[line.strip()] = None
+        except OSError:
+            pass
+
+    def add_feed(self, url):
+        os.makedirs(self.d, exist_ok=True)
+        with open(os.path.join(self.d, "feeds"), "a", encoding="utf-8") as f:
+            f.write(url + "\n")
+        self.feeds.append((url, url))
+
+    def is_seen(self, aid):
+        return aid in self.seen
+
+    def set_seen(self, aid, on):
+        if on:
+            self.seen.pop(aid, None)
+            self.seen[aid] = None
+            while len(self.seen) > SEEN_MAX:
+                del self.seen[next(iter(self.seen))]
+        else:
+            self.seen.pop(aid, None)
+        self.dirty = True
+
+    def save(self):
+        if not self.dirty:
+            return
+        os.makedirs(self.d, exist_ok=True)
+        path = os.path.join(self.d, "seen")
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            f.writelines(k + "\n" for k in self.seen)
+        os.replace(path + ".tmp", path)
+        self.dirty = False
+
+
+# ---- the proxy -------------------------------------------------------------
+
+class Proxy:
+    def __init__(self, cfg):
+        self.host = cfg["HOST"]
+        self.port = int(cfg["PORT"])
+        self.token = cfg["TOKEN"]
+
+    def request(self, method, path, **params):
+        """Returns (more, rows); raises Error with the proxy's message."""
+        q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+        try:
+            c = http.client.HTTPConnection(self.host, self.port, timeout=40)
+            c.request(method, path + ("?" + q if q else ""),
+                      headers={"X-Token": self.token, "Connection": "close"})
+            body = c.getresponse().read().decode("utf-8", "replace")
+            c.close()
+        except (OSError, http.client.HTTPException) as e:
+            raise Error("cannot reach %s:%d (%s)" % (self.host, self.port, e))
+        lines = body.split("\n")
+        head = lines[0]
+        if head.startswith("ERR "):
+            raise Error(head[4:])
+        if head != "OK" and not head.startswith("OK "):
+            raise Error("unexpected answer from the proxy")
+        more = ""
+        for word in head.split()[1:]:
+            if word.startswith("more="):
+                more = word[5:]
+        rows = lines[1:]
+        if rows and rows[-1] == "":
+            rows.pop()
+        return more, rows
+
+
+# ---- text width ------------------------------------------------------------
+
+def char_cols(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def cols_of(s):
+    return sum(char_cols(ch) for ch in s)
+
+
+def cut(s, w):
+    """s cut (or padded with spaces) to exactly w columns."""
+    out, c = [], 0
+    for ch in s:
+        x = char_cols(ch)
+        if c + x > w:
+            break
+        out.append(ch)
+        c += x
+    return "".join(out) + " " * max(w - c, 0)
+
+
+# ---- the terminal ----------------------------------------------------------
+
+class Term:
+    def __init__(self, cfg):
+        self.fd = sys.stdin.fileno()
+        self.fixed = (int(cfg["HEIGHT"] or 0), int(cfg["WIDTH"] or 0))
+        self.buf = []
+        self.rows, self.cols = 24, 80
+        self.size()
+
+    def __enter__(self):
+        self.old = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        self.w("\x1b[?1049h\x1b[?25l")
+        return self
+
+    def __exit__(self, *exc):
+        self.w("\x1b[0m\x1b[?25h\x1b[?1049l")
+        self.flush()
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def size(self):
+        s = shutil.get_terminal_size()
+        rows, cols = self.fixed[0] or s.lines, self.fixed[1] or s.columns
+        changed = (rows, cols) != (self.rows, self.cols)
+        self.rows, self.cols = max(rows, 8), max(cols, 30)
+        return changed
+
+    def w(self, s):
+        self.buf.append(s)
+
+    def flush(self):
+        if self.buf:
+            os.write(sys.stdout.fileno(), "".join(self.buf).encode("utf-8", "replace"))
+            self.buf = []
+
+    def goto(self, y):
+        self.w("\x1b[%d;1H" % y)
+
+    def _byte(self, timeout=None):
+        if timeout is not None and not select.select([self.fd], [], [], timeout)[0]:
+            return None
+        b = os.read(self.fd, 1)
+        return b[0] if b else 3
+
+    def key(self):
+        """One key: a character, or UP DOWN LEFT RIGHT PGUP PGDN HOME END
+        ENTER ESC QUIT, or RESIZE when the window changed size."""
+        self.flush()
+        while not select.select([self.fd], [], [], 0.5)[0]:
+            if self.size():
+                return "RESIZE"
+        c = self._byte()
+        if c == 3:
+            return "QUIT"
+        if c in (10, 13):
+            return "ENTER"
+        if c == 0x1b:
+            c = self._byte(0.05)
+            if c is None or c not in (ord("["), ord("O")):
+                return "ESC"
+            seq = ""
+            while True:
+                c = self._byte(0.2)
+                if c is None:
+                    break
+                seq += chr(c)
+                if 0x40 <= c <= 0x7e:
+                    break
+            return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT", "5~": "PGUP", "6~": "PGDN",
+                    "H": "HOME", "F": "END", "1~": "HOME", "4~": "END"}.get(seq, "")
+        if c >= 0x80:            # the rest of a UTF-8 character: not a command
+            while self._byte(0.01) is not None:
+                pass
+            return ""
+        return chr(c)
+
+    def prompt(self, q):
+        """Read a line with the terminal's own editing."""
+        self.goto(self.rows)
+        self.w("\x1b[0m\x1b[K" + q + "\x1b[?25h")
+        self.flush()
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        try:
+            line = sys.stdin.readline()
+        finally:
+            tty.setraw(self.fd)
+            self.w("\x1b[?25l")
+        return line.strip()
+
+
+# ---- the reader ------------------------------------------------------------
+
+class Sel:
+    def __init__(self, n=0):
+        self.n, self.sel, self.top = n, 0, 0
+
+
+class App:
+    def __init__(self, proxy, store, term):
+        self.p, self.s, self.t = proxy, store, term
+
+    # frame
+
+    def clear(self):
+        self.t.w("\x1b[0m\x1b[H\x1b[2J")
+
+    def bar(self, y, left, right):
+        cols = self.t.cols
+        self.t.goto(y)
+        self.t.w(C_BAR + " " + cut(left, max(cols - cols_of(right) - 3, 0)) + right + " " + C_OFF)
+
+    def status(self, colour, msg):
+        self.t.goto(self.t.rows)
+        self.t.w(colour + cut(msg, self.t.cols - 1) + C_OFF)
+        self.t.flush()
+
+    def fail(self, what, err):
+        self.status(C_ERR, "%s: %s  (any key)" % (what, err))
+        return self.t.key()
+
+    def list_height(self):
+        return self.t.rows - 2
+
+    def move(self, l, k):
+        h = self.list_height()
+        if k in ("UP", "k"):
+            l.sel -= 1
+        elif k in ("DOWN", "j"):
+            l.sel += 1
+        elif k in ("PGUP", "b"):
+            l.sel -= h
+        elif k in ("PGDN", " "):
+            l.sel += h
+        elif k in ("HOME", "<"):
+            l.sel = 0
+        elif k in ("END", ">"):
+            l.sel = l.n - 1
+        elif k != "RESIZE":
+            return False
+        l.sel = max(min(l.sel, l.n - 1), 0)
+        if l.sel < l.top:
+            l.top = l.sel
+        if l.sel >= l.top + h:
+            l.top = l.sel - h + 1
+        return True
+
+    # marks
+
+    def mark_read(self, a, read):
+        if a["id"].startswith("L"):
+            self.s.set_seen(a["id"], read)
+            self.s.save()
+        else:
+            try:
+                self.p.request("POST", "/mark", id=a["id"], read=int(read))
+            except Error as e:
+                self.fail("Could not mark the article", e)
+                return False
+        if read:
+            a["flags"].add("r")
+        else:
+            a["flags"].discard("r")
+        return True
+
+    def toggle_star(self, a):
+        if a["id"].startswith("L"):
+            self.status(C_ERR, "Local articles cannot be starred (any key)")
+            self.t.key()
+            return
+        on = "s" not in a["flags"]
+        try:
+            self.p.request("POST", "/star", id=a["id"], on=int(on))
+        except Error as e:
+            self.fail("Could not star the article", e)
+            return
+        if on:
+            a["flags"].add("s")
+        else:
+            a["flags"].discard("s")
+
+    def add_feed(self):
+        url = self.t.prompt("Feed URL (empty to cancel): ")
+        if not url:
+            return
+        self.status(C_OFF, "Add to the feed server (s) or only to this computer (l)? ")
+        k = self.t.key()
+        if k == "l":
+            self.s.add_feed(url)
+        elif k == "s":
+            self.status(C_DIM, "Subscribing...")
+            try:
+                self.p.request("POST", "/subscribe", url=url)
+            except Error as e:
+                self.fail("Could not subscribe", e)
+
+    # the article view
+
+    def load_item(self, a, url, full, item, cursor=None):
+        self.status(C_DIM, "Fetching the whole article..." if full else "Loading...")
+        more, rows = self.p.request("GET", "/item", id=a["id"], w=self.t.cols - 1,
+                                    full=1 if full else None, url=url, c=cursor)
+        if not cursor:
+            item.update(lines=[], kind="", link="", feed="", date="")
+        item["more"] = more
+        body = False
+        for r in rows:
+            if body:
+                item["lines"].append(r)
+                continue
+            if r == "":
+                body = True
+                continue
+            k, _, v = r.partition("\t")
+            if k == "T" and not cursor:
+                a["title"] = v
+            elif k in ("X", "L", "F", "D"):
+                item[{"X": "kind", "L": "link", "F": "feed", "D": "date"}[k]] = v
+
+    def read_article(self, a, url):
+        """-1 for the previous article, 1 for the next, 0 to go back."""
+        item, top, full = {}, 0, False
+        try:
+            self.load_item(a, url, False, item)
+        except Error as e:
+            self.fail("Could not load the article", e)
+            return 0
+        width = self.t.cols
+        if "r" not in a["flags"]:
+            self.mark_read(a, True)
+        while True:
+            h = self.t.rows - 5
+            if self.t.cols != width:      # rewrap for the new width
+                width = self.t.cols
+                try:
+                    self.load_item(a, url, full, item)
+                except Error:
+                    pass
+                top = 0
+            lines = item["lines"]
+            if item["more"] and top + h >= len(lines):
+                try:
+                    self.load_item(a, url, full, item, item["more"])
+                except Error:
+                    item["more"] = ""
+                lines = item["lines"]
+            self.clear()
+            self.bar(1, a["title"], "*" if "s" in a["flags"] else "")
+            self.t.goto(2)
+            self.t.w(C_DIM + cut("%s  %s" % (item["feed"], item["date"]), self.t.cols - 1) + C_OFF)
+            for i in range(min(h, len(lines) - top)):
+                self.t.goto(4 + i)            # an empty line under feed and date
+                self.t.w(cut(lines[top + i], self.t.cols - 1))
+            n = len(lines)
+            right = "%d%%" % ((min(top + h, n) * 100 // n) if n else 100)
+            if item["kind"] == "excerpt":
+                self.bar(self.t.rows, "Excerpt only - f: whole article  spc/b page  n/p next/prev  s star  q back", right)
+            else:
+                self.bar(self.t.rows, "spc/b page  n/p next/prev  s star  u unread  l link  f full  q back", right)
+            k = self.t.key()
+            if k in ("QUIT", "q", "LEFT", "ESC"):
+                return 0
+            elif k in (" ", "PGDN"):
+                if top + h < n:
+                    top += h - 1
+                else:
+                    return 1          # space at the end goes on, like a pager
+            elif k in ("b", "PGUP"):
+                top = max(top - (h - 1), 0)
+            elif k in ("DOWN", "j", "ENTER"):
+                if top + h < n:
+                    top += 1
+            elif k in ("UP", "k"):
+                top = max(top - 1, 0)
+            elif k in ("HOME", "<"):
+                top = 0
+            elif k in ("n", "RIGHT"):
+                return 1
+            elif k == "p":
+                return -1
+            elif k == "s":
+                self.toggle_star(a)
+            elif k == "u":
+                if self.mark_read(a, False):
+                    return 0
+            elif k == "l":
+                self.status(C_OFF, item["link"] + "  (any key)")
+                self.t.key()
+            elif k == "f":
+                top, full = 0, True
+                try:
+                    self.load_item(a, url, True, item)
+                except Error as e:
+                    self.fail("Could not fetch the whole article", e)
+                    full = False
+                    try:
+                        self.load_item(a, url, False, item)
+                    except Error:
+                        pass
+
+    # the article list
+
+    def load_list(self, arts, stream, url, unread, cursor=None):
+        self.status(C_DIM, "Loading...")
+        if url:
+            more, rows = self.p.request("GET", "/list", url=url, n=50, c=cursor)
+        else:
+            more, rows = self.p.request("GET", "/list", s=stream, n=50,
+                                        unread=1 if unread else None, c=cursor)
+        if not cursor:
+            del arts[:]
+        for r in rows:
+            if len(arts) >= ART_MAX:
+                break
+            f = (r.split("\t") + [""] * 5)[:5]
+            a = {"id": f[0], "flags": set(f[1]), "date": f[2], "feed": f[3], "title": f[4]}
+            if url and self.s.is_seen(a["id"]):
+                a["flags"].add("r")
+            arts.append(a)
+        return more
+
+    def draw_art(self, y, a, selected):
+        cols = self.t.cols
+        unread = "r" not in a["flags"]
+        fw = 14 if cols > 60 else 0
+        self.t.goto(y)
+        self.t.w(C_SEL if selected else C_OFF if unread else C_READ)
+        self.t.w(("*" if "s" in a["flags"] else " ") + ("o " if unread else "  "))
+        self.t.w(cut(a["date"][5:], 12))       # "MM-DD HH:MM "
+        if fw:
+            self.t.w(cut(a["feed"], fw) + " ")
+        self.t.w(cut(a["title"], cols - 16 - (fw + 1 if fw else 0) - 1) + C_OFF)
+
+    def article_list(self, stream, url, title):
+        """True when the user quits the program."""
+        arts, unread = [], not url
+        try:
+            more = self.load_list(arts, stream, url, unread)
+        except Error as e:
+            return self.fail("Could not load the list", e) == "QUIT"
+        l = Sel()
+        while True:
+            l.n = len(arts)
+            self.clear()
+            self.bar(1, title, "%d%s%s" % (len(arts), "+" if more else "", " unread" if unread else ""))
+            if not arts:
+                self.t.goto(3)
+                self.t.w("  No unread articles. U shows all." if unread else "  Nothing here.")
+            for i in range(min(self.list_height(), len(arts) - l.top)):
+                self.draw_art(2 + i, arts[l.top + i], l.top + i == l.sel)
+            self.bar(self.t.rows, "ret read  u read/unread  r reload  q back" if url else
+                     "ret read  s star  u read/unread  U all/unread  a add feed  r reload  q back", "")
+            k = self.t.key()
+            if k == "QUIT":
+                return True
+            if k in ("q", "LEFT", "ESC"):
+                return False
+            try:
+                if self.move(l, k):
+                    if l.sel == len(arts) - 1 and more:
+                        more = self.load_list(arts, stream, url, unread, more)
+                    continue
+                if not arts and k not in ("U", "r", "a"):
+                    continue
+                if k in ("ENTER", "RIGHT"):
+                    while True:
+                        r = self.read_article(arts[l.sel], url)
+                        if r > 0 and l.sel + 1 >= len(arts) and more:
+                            more = self.load_list(arts, stream, url, unread, more)
+                        if r > 0 and l.sel + 1 < len(arts):
+                            l.sel += 1
+                        elif r < 0 and l.sel > 0:
+                            l.sel -= 1
+                        else:
+                            break
+                    l.n = len(arts)
+                    h = self.list_height()
+                    if l.sel < l.top or l.sel >= l.top + h:
+                        l.top = max(l.sel - h // 2, 0)
+                elif k == "s" and not url:
+                    self.toggle_star(arts[l.sel])
+                elif k == "u":
+                    self.mark_read(arts[l.sel], "r" not in arts[l.sel]["flags"])
+                elif k == "U" and not url:
+                    unread = not unread
+                    l.sel = l.top = 0
+                    more = self.load_list(arts, stream, url, unread)
+                elif k == "r":
+                    l.sel = l.top = 0
+                    more = self.load_list(arts, stream, url, unread)
+                elif k == "a":
+                    self.add_feed()
+            except Error as e:
+                if self.fail("Could not load the list", e) == "QUIT":
+                    return True
+
+    # categories, feeds and local feeds
+
+    def load_cats(self):
+        self.status(C_DIM, "Loading...")
+        _, rows = self.p.request("GET", "/cats")
+        out = []
+        for r in rows:
+            f = (r.split("\t") + [""] * 3)[:3]
+            out.append({"id": f[0], "unread": f[1], "title": f[2], "kind": 0})
+        if self.s.feeds:
+            out.append({"id": "", "unread": str(len(self.s.feeds)),
+                        "title": "Local feeds (on this computer)", "kind": 1})
+        return out
+
+    def sub_streams(self, parent):
+        if parent["kind"] == 1:
+            subs = [{"id": "", "unread": "", "title": name, "kind": 2, "url": url}
+                    for url, name in self.s.feeds]
+            return self.stream_view(subs, "Local feeds", 2)
+        try:
+            self.status(C_DIM, "Loading...")
+            _, rows = self.p.request("GET", "/feeds", c=parent["id"])
+        except Error as e:
+            return self.fail("Could not load the feeds", e) == "QUIT"
+        subs = []
+        for r in rows:
+            f = (r.split("\t") + [""] * 3)[:3]
+            subs.append({"id": f[0], "unread": f[1], "title": f[2], "kind": 0})
+        return self.stream_view(subs, parent["title"], 1)
+
+    def open_stream(self, s):
+        if s["kind"] == 1:
+            return self.sub_streams(s)
+        if s["kind"] == 2:
+            return self.article_list(None, s["url"], s["title"])
+        return self.article_list(s["id"], None, s["title"])
+
+    def draw_stream(self, y, s, selected):
+        self.t.goto(y)
+        has_unread = s["unread"] not in ("", "0")
+        self.t.w(C_SEL if selected else C_OFF if has_unread else C_READ)
+        self.t.w("  " + cut(s["unread"], 6) + " " + cut(s["title"], self.t.cols - 10) + C_OFF)
+
+    def stream_view(self, items, title, level):
+        """level 0: categories, 1: feeds of a category, 2: local feeds.
+        True when the user quits the program."""
+        l = Sel(len(items))
+        while True:
+            l.n = len(items)
+            self.clear()
+            self.bar(1, title, "" if level else "amifeed " + VERSION)
+            for i in range(min(self.list_height(), len(items) - l.top)):
+                self.draw_stream(2 + i, items[l.top + i], l.top + i == l.sel)
+            if not items:
+                self.t.goto(3)
+                self.t.w("  Nothing here.")
+            self.bar(self.t.rows, "ret articles  f feeds  a add feed  r reload  q quit" if level == 0
+                     else "ret articles  q back", "")
+            k = self.t.key()
+            if k == "QUIT":
+                return True
+            if k in ("q", "ESC") or (level and k == "LEFT"):
+                return False
+            if self.move(l, k) or not items:
+                continue
+            cur = items[l.sel]
+            if k in ("ENTER", "RIGHT"):
+                if self.open_stream(cur):
+                    return True
+            elif k == "f" and level == 0 and (cur["kind"] == 1 or cur["id"].startswith("c")):
+                if self.sub_streams(cur):
+                    return True
+            if level == 0 and k in ("r", "ENTER", "RIGHT", "a", "f"):
+                if k == "a":
+                    self.add_feed()
+                try:
+                    items[:] = self.load_cats()
+                except Error as e:
+                    self.fail("Could not load the categories", e)
+                l.n = len(items)
+                l.sel = min(l.sel, max(l.n - 1, 0))
+
+    def run(self):
+        try:
+            cats = self.load_cats()
+        except Error as e:
+            self.fail("Could not reach the proxy", e)
+            return
+        self.stream_view(cats, "amifeed", 0)
+
+
+# ---- commands for scripts --------------------------------------------------
+
+USAGE = """amifeed %s - RSS reader (needs the amifeed proxy)
+  amifeed                  the reader
+  amifeed list [stream]    categories, or the unread articles of a stream
+  amifeed read <id> [url]  print an article and mark it read
+  amifeed add <url> [LOCAL]  subscribe on the server, or LOCAL only here
+  amifeed sync             show the unread counts
+Settings: %s/client.conf (HOST=, PORT=, TOKEN= or TOKEN_FILE=, WIDTH=, HEIGHT=)
+""" % (VERSION, conf_dir())
+
+
+def script(proxy, store, args):
+    cmd = args[0]
+    if cmd in ("list", "sync"):
+        if len(args) > 1 and cmd == "list":
+            _, rows = proxy.request("GET", "/list", s=args[1], n=100, unread=1)
+        else:
+            _, rows = proxy.request("GET", "/cats")
+        print("\n".join(rows))
+    elif cmd == "read" and len(args) > 1:
+        aid, url = args[1], args[2] if len(args) > 2 else None
+        width = int(shutil.get_terminal_size().columns) - 1
+        more, rows = proxy.request("GET", "/item", id=aid, url=url, w=width)
+        body = False
+        for r in rows:
+            if not body and r == "":
+                body = True
+            if body:
+                print(r)
+            elif r[:2] in ("T\t", "L\t"):
+                print(r[2:])
+        if more:
+            print("[...]")
+        if aid.startswith("L"):
+            store.set_seen(aid, True)
+        else:
+            proxy.request("POST", "/mark", id=aid, read=1)
+    elif cmd == "add" and len(args) > 1:
+        if len(args) > 2 and args[2].upper() == "LOCAL":
+            store.add_feed(args[1])
+        else:
+            _, rows = proxy.request("POST", "/subscribe", url=args[1])
+            print("\n".join(rows))
+    else:
+        sys.stdout.write(USAGE)
+        return 5
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("?", "-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return 0
+    d = conf_dir()
+    cfg = load_config(d)
+    proxy, store = Proxy(cfg), Store(d)
+    try:
+        if args:
+            return script(proxy, store, args)
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            sys.exit("amifeed: the reader needs a terminal; see amifeed --help for commands")
+        with Term(cfg) as term:
+            App(proxy, store, term).run()
+        return 0
+    except Error as e:
+        sys.stderr.write("amifeed: %s\n" % e)
+        return 10
+    finally:
+        store.save()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

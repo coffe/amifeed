@@ -1,0 +1,43 @@
+# amifeed settings. Copy to amifeed.toml and fill in.
+# Secrets can also come from files (*_file) or the environment
+# (AMIFEED_TOKEN, AMIFEED_GREADER_PASSWORD).
+
+[server]
+listen = "0.0.0.0"
+port = 8642
+# The shared secret every client sends as X-Token. At least 12 characters;
+# make one with: python3 -c "import secrets; print(secrets.token_urlsafe(18))"
+token_file = "token"            # relative to this file
+# Only these networks may talk to the proxy. The default is loopback and
+# the private ranges; the channel is plain HTTP, so keep it on your LAN.
+# allow_nets = ["192.168.1.0/24"]
+
+[greader]
+# The Google Reader API of your feed server. For FreshRSS:
+#   https://your.freshrss/api/greader.php
+# and an API password set under Profile -> API management.
+url = "https://freshrss.example.com/api/greader.php"
+user = "me"
+password_file = "greader-password"
+
+[fetch]
+# Used for local feeds (url=) and full article text (full=1).
+timeout = 10
+max_bytes = 2097152
+# Local feeds and article pages on private addresses are refused, so a
+# client cannot use the proxy to look into your network. Set to true if
+# you want to read feeds from your own LAN.
+allow_private_feeds = false
+
+[cache]
+path = "amifeed-cache.sqlite"   # relative to the working directory (/data in Docker)
+ttl_days = 7                    # extracted article text
+max_mb = 50
+local_feed_ttl = 900            # seconds a parsed local feed is reused
+
+[text]
+# Feeds whose articles are always fetched in full, as server stream ids
+# ("feed/12") or feed URLs.
+fulltext_feeds = []
+# Text shorter than this counts as an excerpt (flag x, X excerpt).
+excerpt_chars = 400

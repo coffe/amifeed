@@ -1,0 +1,16 @@
+name: amifeed
+services:
+  amifeed:
+    build: .
+    container_name: amifeed
+    restart: unless-stopped
+    # Host networking, so the proxy sees the real client address and
+    # allow_nets means something (behind Docker's NAT every client looks
+    # like 172.17.0.1).
+    network_mode: host
+    volumes:
+      # amifeed.toml, token and password; readable by uid 1000 (the container user)
+      - ${AMIFEED_CONFIG_DIR:-./config}:/config:ro
+      - amifeed-data:/data      # the article cache
+volumes:
+  amifeed-data:
