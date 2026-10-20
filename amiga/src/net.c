@@ -5,6 +5,8 @@
 #include <proto/dos.h>
 #include <proto/bsdsocket.h>
 #include <sys/socket.h>
+#include <sys/filio.h>
+#include <sys/errno.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <string.h>
@@ -54,16 +56,92 @@ void urlenc(char *dst, const char *src, int size)
 	dst[n] = 0;
 }
 
+/*
+ * The socket is non-blocking and every wait goes through WaitSelect() with a
+ * timeout, so a link that drops in the middle of a request (PPP over the
+ * serial port does) gives an error instead of a reader that hangs forever.
+ * Ctrl-C breaks the wait too.
+ */
+#define CONNECT_SECS 15
+#define IDLE_SECS    40   /* full=1 makes the proxy fetch a web page first */
+
+/* Wait until s can be read (write=0) or written (write=1).
+ * Returns 1 when ready, 0 on timeout, -1 on Ctrl-C. */
+static int wait_sock(LONG s, int write, long secs)
+{
+	fd_set fds;
+	struct timeval tv;
+	ULONG sigs;
+	LONG n;
+
+	for (;;) {
+		FD_ZERO(&fds);
+		FD_SET(s, &fds);
+		tv.tv_sec = secs;
+		tv.tv_usec = 0;
+		sigs = SIGBREAKF_CTRL_C;
+		n = WaitSelect(s + 1, write ? NULL : &fds, write ? &fds : NULL, NULL, (APTR)&tv, &sigs);
+		if (n > 0)
+			return 1;
+		if (sigs & SIGBREAKF_CTRL_C)
+			return -1;
+		if (n == 0)
+			return 0;
+		if (Errno() != EINTR)
+			return 1;    /* let the next call report the error */
+	}
+}
+
+static int wait_fail(int w, const char *what)
+{
+	if (w < 0)
+		sprintf(err_msg, "%s: cancelled", what);
+	else
+		sprintf(err_msg, "%s: the proxy stopped answering (link down?)", what);
+	return 0;
+}
+
 static int send_all(LONG s, const char *p, long len)
 {
 	long n;
+	int w;
 
 	while (len > 0) {
+		if ((w = wait_sock(s, 1, IDLE_SECS)) <= 0)
+			return wait_fail(w, "sending");
 		n = send(s, (APTR)p, len, 0);
-		if (n <= 0)
+		if (n < 0 && Errno() == EWOULDBLOCK)
+			continue;
+		if (n <= 0) {
+			sprintf(err_msg, "sending failed (%ld)", Errno());
 			return 0;
+		}
 		p += n;
 		len -= n;
+	}
+	return 1;
+}
+
+static int connect_to(LONG s, struct sockaddr_in *sa)
+{
+	LONG err = 0, len = sizeof(err);
+	int w;
+
+	if (connect(s, (struct sockaddr *)sa, sizeof(*sa)) == 0)
+		return 1;
+	if (Errno() != EINPROGRESS) {
+		err = Errno();
+	} else if ((w = wait_sock(s, 1, CONNECT_SECS)) <= 0) {
+		if (w < 0)
+			return wait_fail(w, "connecting");
+		sprintf(err_msg, "cannot connect to %s:%d (timeout)", cfg.host, cfg.port);
+		return 0;
+	} else if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+		err = Errno();
+	}
+	if (err) {
+		sprintf(err_msg, "cannot connect to %s:%d (%ld)", cfg.host, cfg.port, err);
+		return 0;
 	}
 	return 1;
 }
@@ -72,11 +150,11 @@ long http(const char *method, const char *path)
 {
 	static char req[1024];
 	struct sockaddr_in sa;
-	struct timeval tv;
 	struct hostent *he;
-	LONG s, n = 0;
+	LONG s, n = 0, one = 1;
 	long total = 0;
 	char *body;
+	int w = 1;
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sin_family = AF_INET;
@@ -96,14 +174,8 @@ long http(const char *method, const char *path)
 		sprintf(err_msg, "socket() failed (%ld)", Errno());
 		return -1;
 	}
-	/* full=1 makes the proxy fetch a web page first: give it time */
-	tv.tv_sec = 40;
-	tv.tv_usec = 0;
-	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-	if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		sprintf(err_msg, "cannot connect to %s:%d (%ld)", cfg.host, cfg.port, Errno());
+	IoctlSocket(s, FIONBIO, (APTR)&one);
+	if (!connect_to(s, &sa)) {
 		CloseSocket(s);
 		return -1;
 	}
@@ -111,18 +183,29 @@ long http(const char *method, const char *path)
 	        method, path, cfg.latin1 ? (strchr(path, '?') ? "&" : "?") : "",
 	        cfg.latin1 ? "cs=latin1" : "", cfg.host, cfg.token);
 	if (!send_all(s, req, strlen(req))) {
-		sprintf(err_msg, "sending failed (%ld)", Errno());
 		CloseSocket(s);
 		return -1;
 	}
-	while (total < RESP_MAX && (n = recv(s, resp_buf + total, RESP_MAX - total, 0)) > 0)
+	/* read until the proxy closes; a half answer is no answer */
+	while (total < RESP_MAX) {
+		if ((w = wait_sock(s, 0, IDLE_SECS)) <= 0)
+			break;
+		n = recv(s, resp_buf + total, RESP_MAX - total, 0);
+		if (n < 0 && Errno() == EWOULDBLOCK)
+			continue;
+		if (n <= 0)
+			break;
 		total += n;
-	if (n < 0 && total == 0) {
-		sprintf(err_msg, "no answer from the proxy (%ld)", Errno());
-		CloseSocket(s);
-		return -1;
 	}
 	CloseSocket(s);
+	if (w <= 0) {
+		wait_fail(w, "reading");
+		return -1;
+	}
+	if (n < 0) {
+		sprintf(err_msg, "no answer from the proxy (%ld)", Errno());
+		return -1;
+	}
 	resp_buf[total] = 0;
 
 	body = strstr(resp_buf, "\r\n\r\n");

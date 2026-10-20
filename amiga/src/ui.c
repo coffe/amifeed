@@ -460,8 +460,10 @@ static int read_article(struct Art *a, const char *url)
 		mark_read(a, 1);
 	for (;;) {
 		/* the next part of a long article, when the reader gets near its end */
-		if (item_more[0] && top + h >= item_n)
-			load_item(a, url, full, item_more);
+		if (item_more[0] && top + h >= item_n && !load_item(a, url, full, item_more)) {
+			fail("Could not load the rest of the article");
+			item_more[0] = 0;
+		}
 		clear();
 		goto_line(1);
 		bar(1, a->title, strchr(a->flags, 's') ? "*" : "");
@@ -610,16 +612,17 @@ static int article_list(const char *stream, const char *url, const char *title)
 		if (k == 'q' || k == K_LEFT || k == K_ESC)
 			return 0;
 		if (list_move(&l, k)) {
-			if (l.sel == n_arts - 1 && list_more[0])
-				load_list(stream, url, unread, 1);
+			if (l.sel == n_arts - 1 && list_more[0] && !load_list(stream, url, unread, 1))
+				fail("Could not load more articles");
 			continue;
 		}
 		if (!n_arts && k != 'U' && k != 'r' && k != 'a')
 			continue;
 		if (k == K_ENTER || k == K_RIGHT) {
 			while ((r = read_article(&arts[l.sel], url)) != 0) {
-				if (r > 0 && l.sel + 1 >= n_arts && list_more[0])
-					load_list(stream, url, unread, 1);
+				if (r > 0 && l.sel + 1 >= n_arts && list_more[0] &&
+				    !load_list(stream, url, unread, 1))
+					fail("Could not load more articles");
 				l.n = n_arts;
 				if (r > 0 && l.sel + 1 < n_arts)
 					l.sel++;
@@ -638,10 +641,12 @@ static int article_list(const char *stream, const char *url, const char *title)
 		} else if (k == 'U' && !url) {
 			unread = !unread;
 			l.sel = l.top = 0;
-			load_list(stream, url, unread, 0);
+			if (!load_list(stream, url, unread, 0))
+				fail("Could not load the list");
 		} else if (k == 'r') {
 			l.sel = l.top = 0;
-			load_list(stream, url, unread, 0);
+			if (!load_list(stream, url, unread, 0))
+				fail("Could not load the list");
 		} else if (k == 'a') {
 			add_feed();
 		}
