@@ -41,3 +41,8 @@ local_feed_ttl = 900            # seconds a parsed local feed is reused
 fulltext_feeds = []
 # Text shorter than this counts as an excerpt (flag x, X excerpt).
 excerpt_chars = 400
+
+[images]
+# Pictures (GET /img) are downloaded up to this size, then scaled down and
+# sent as sixel graphics. The results are kept in the cache above.
+max_bytes = 8388608

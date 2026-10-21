@@ -55,6 +55,8 @@ static struct Stream streams[STREAM_MAX];
 static struct Art arts[ART_MAX];
 static struct Resp resp;
 static int rows = 24, cols = 80;
+static int cell_w = 8, cell_h = 16;  /* pixels of one character cell */
+static int sixel;                    /* the console draws sixel pictures (UP-Term's XCON) */
 static BPTR in, out;
 static int raw_on;
 
@@ -198,6 +200,39 @@ static int read_key(void)
 	return 0;
 }
 
+/* Send q and read the answer up to (and with) the final byte fin. */
+static int ask(const char *q, char fin, char *b, int size)
+{
+	int n = 0, c;
+
+	ostr(q);
+	oflush();
+	while (n < size - 1 && (c = getc_wait(300000)) >= 0) {
+		b[n++] = c;
+		if (c == fin)
+			break;
+	}
+	b[n] = 0;
+	return n;
+}
+
+/* Pictures need sixel (DA1 lists 4) and the cell size in pixels. */
+static void query_graphics(void)
+{
+	char b[48], *p;
+	int ch, cw;
+
+	ask("\x1b[c", 'c', b, sizeof(b));
+	for (p = strchr(b, ';'); p; p = strchr(p + 1, ';'))
+		if (p[1] == '4' && (p[2] == ';' || p[2] == 'c'))
+			sixel = 1;
+	if (sixel && ask("\x1b[16t", 't', b, sizeof(b)) &&
+	    sscanf(b, "\x1b[6;%d;%dt", &ch, &cw) == 2 && ch >= 6 && cw >= 4) {
+		cell_h = ch;
+		cell_w = cw;
+	}
+}
+
 /* Ask the console how big the window is: xterm first, then the Amiga way. */
 static void query_size(void)
 {
@@ -228,6 +263,7 @@ static void query_size(void)
 		rows = r;
 		cols = w;
 	}
+	query_graphics();
 	if (cfg.height)
 		rows = cfg.height;
 	if (cfg.width)
@@ -243,7 +279,8 @@ static void bar(int y, const char *left, const char *right)
 	goto_line(y);
 	ostr(C_BAR);
 	ostr(" ");
-	ocols(left, cols - rw - 3 > 0 ? cols - rw - 3 : 0);
+	ocols(left, cols - rw - 4 > 0 ? cols - rw - 4 : 0);
+	ostr(" ");                    /* a cut text never runs into the right one */
 	ostr(right);
 	ostr(" " C_OFF);              /* cols - 1 in all: the last column would scroll */
 }
@@ -338,6 +375,7 @@ static char *item_line[ITEM_LINES];
 static int item_n, item_used;
 static char item_more[200];
 static char item_kind[16], item_link[URL_MAX], item_feed[64], item_date[20];
+static int item_pics;
 
 static int is_local_id(const char *id)
 {
@@ -361,6 +399,7 @@ static int load_item(struct Art *a, const char *url, int full, const char *curso
 		strcat(path, cursor);
 	} else {
 		item_n = item_used = 0;
+		item_pics = 0;
 	}
 	status(C_DIM, full ? "Fetching the whole article..." : "Loading...");
 	if (!request(&resp, "GET", path))
@@ -378,6 +417,9 @@ static int load_item(struct Art *a, const char *url, int full, const char *curso
 				field(resp.rows[i], 1, item_feed, sizeof(item_feed));
 			} else if (resp.rows[i][0] == 'D') {
 				field(resp.rows[i], 1, item_date, sizeof(item_date));
+			} else if (resp.rows[i][0] == 'I') {
+				field(resp.rows[i], 1, f, sizeof(f));
+				item_pics = atoi(f);
 			} else if (resp.rows[i][0] == 'T' && !cursor) {
 				field(resp.rows[i], 1, f, sizeof(a->title));
 				strcpy(a->title, f);
@@ -446,11 +488,61 @@ static int toggle_star(struct Art *a)
 	return 1;
 }
 
+/* The article's pictures, one at a time, as big as the window allows. */
+static void show_pictures(struct Art *a, const char *url, int full)
+{
+	char path[URL_MAX * 3 + 160], enc[URL_MAX * 3], right[40], *six;
+	int n = 1, k, pw, ph;
+	long len;
+
+	for (;;) {
+		clear();
+		bar(1, a->title, "");
+		status(C_DIM, "Loading the picture... (Ctrl-C stops)");
+		sprintf(path, "/img?id=%s&n=%d&w=%d&h=%d&kb=60%s", a->id, n,
+		        cols * cell_w - cell_w, (rows - 3) * cell_h, full ? "&full=1" : "");
+		if (url) {
+			urlenc(enc, url, sizeof(enc));
+			strcat(path, "&url=");
+			strcat(path, enc);
+		}
+		len = http("GET", path);
+		six = len > 0 ? strchr(resp_buf, '\n') : NULL;
+		if (len < 0 || strncmp(resp_buf, "OK ", 3) || !six) {
+			if (six)
+				*six = 0;
+			strncpy(resp.status, len < 0 ? err_msg : !strncmp(resp_buf, "ERR ", 4) ? resp_buf + 4
+			        : "broken answer from the proxy", sizeof(resp.status) - 1);
+			resp.status[sizeof(resp.status) - 1] = 0;
+			k = fail("No picture");
+		} else {
+			pw = ph = 0;
+			sscanf(resp_buf, "OK w=%d h=%d", &pw, &ph);
+			goto_line(2);
+			oflush();
+			Write(out, six + 1, len - (six + 1 - resp_buf));
+			sprintf(right, "%d/%d  %dx%d", n, item_pics, pw, ph);
+			bar(rows, item_pics > 1 ? "n/p next/prev picture  q back" : "q back", right);
+			/* keys that would not change the picture do nothing */
+			while ((k = read_key()) == 0 ||
+			       ((k == 'n' || k == ' ' || k == K_RIGHT) && n >= item_pics) ||
+			       ((k == 'p' || k == 'b') && n <= 1))
+				;
+		}
+		if ((k == 'n' || k == ' ' || k == K_RIGHT) && n < item_pics)
+			n++;
+		else if ((k == 'p' || k == 'b' || k == K_LEFT) && n > 1)
+			n--;
+		else
+			return;
+	}
+}
+
 /* Returns -1 for the previous article, 1 for the next, 0 to go back. */
 static int read_article(struct Art *a, const char *url)
 {
 	int top = 0, k, h = rows - 5, i, full = 0;
-	char right[40], m[URL_MAX + 20];
+	char right[40], m[URL_MAX + 20], pics[32];
 
 	if (!load_item(a, url, 0, NULL)) {
 		fail("Could not load the article");
@@ -477,10 +569,14 @@ static int read_article(struct Art *a, const char *url)
 			ocols(item_line[top + i], cols - 1);
 		}
 		sprintf(right, "%d%%", item_n ? ((top + h > item_n ? item_n : top + h) * 100 / item_n) : 100);
+		pics[0] = 0;
+		if (item_pics && sixel)
+			sprintf(pics, "i %d pic%s  ", item_pics, item_pics > 1 ? "s" : "");
 		if (!strcmp(item_kind, "excerpt"))
-			bar(rows, "Excerpt only - f: whole article  spc/b page  n/p next/prev  s star  q back", right);
+			sprintf(m, "Excerpt - f: whole  %sspc/b page  n/p next/prev  s star  q back", pics);
 		else
-			bar(rows, "spc/b page  n/p next/prev  s star  u unread  l link  f full  q back", right);
+			sprintf(m, "spc/b page  n/p next/prev  %ss star  u unread  l link  f full  q back", pics);
+		bar(rows, m, right);
 		k = read_key();
 		if (k == K_QUIT || k == 'q' || k == K_LEFT || k == K_ESC)
 			return 0;
@@ -510,6 +606,8 @@ static int read_article(struct Art *a, const char *url)
 			sprintf(m, "%s  (any key)", item_link);
 			status(C_BOLD, m);
 			read_key();
+		} else if (k == 'i' && item_pics && sixel) {
+			show_pictures(a, url, full);
 		} else if (k == 'f') {
 			full = 1;
 			top = 0;

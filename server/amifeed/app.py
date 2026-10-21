@@ -13,13 +13,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import trafilatura
 
 from . import greader as gr
-from . import safefetch, textfmt
+from . import images, safefetch, textfmt
 from .cache import Cache
 from .localfeed import LocalFeeds
 
 log = logging.getLogger("amifeed")
 
 BODY_MAX = 64 * 1024
+IMAGE_BODY_MAX = 1 << 20         # /img answers are sixel bytes, not text rows
 TEXT_BUDGET = 60 * 1024          # article text per response, leaves room for the header rows
 _HEX16 = re.compile(r"^[0-9a-f]{16}$")
 _LOCAL = re.compile(r"^L[0-9a-f]{15}$")
@@ -57,6 +58,7 @@ class Amifeed:
         self.local = LocalFeeds(ttl=c["local_feed_ttl"], **self.fetch_opts)
         self.streams = {}       # short stream id -> server stream id
         self.fulltext = set(cfg["text"]["fulltext_feeds"])
+        self.image_fetch_opts = dict(self.fetch_opts, max_bytes=cfg["images"]["max_bytes"])
 
     # -- ids ----------------------------------------------------------------
 
@@ -95,7 +97,8 @@ class Amifeed:
             raise safefetch.FetchError("NOTFOUND", "the article has no link")
         r = safefetch.fetch(link, **self.fetch_opts)
         text = trafilatura.extract(r.body, url=r.url, include_comments=False,
-                                   include_tables=True, favor_recall=True) or ""
+                                   include_tables=True, include_images=True,
+                                   favor_recall=True) or ""
         text = "\n\n".join(p.strip() for p in text.split("\n") if p.strip())
         if not text:
             raise safefetch.FetchError("UPSTREAM", "no article text found on the page")
@@ -164,7 +167,8 @@ class Amifeed:
                 return a["href"]
         return ""
 
-    def item(self, id, url=None, full=False, c=None, width=76):
+    def _article(self, id, url=None, full=False):
+        """Returns (header dict, text, kind, picture addresses)."""
         if _LOCAL.match(id):
             if not url:
                 raise ProtoError("BADREQ", "a local article needs url=")
@@ -185,15 +189,21 @@ class Amifeed:
         else:
             raise ProtoError("BADREQ", "invalid id")
 
-        text = textfmt.html_to_text(body)
+        pics = []
+        text = textfmt.html_to_text(body, pics, head["L"])
         kind = "excerpt" if self._is_excerpt(text) else "content"
         if full or feed_key in self.fulltext or url in self.fulltext:
             try:
-                text = self._extract("x:" + id, head["L"])
+                page = self._extract("x2:" + id, head["L"])
+                pics = []
+                text = textfmt.md_images(page, pics, head["L"])
                 kind = "extracted"
             except safefetch.FetchError as err:
                 text = "[Could not fetch the full article: %s]\n\n%s" % (err, text)
+        return head, text, kind, pics
 
+    def item(self, id, url=None, full=False, c=None, width=76):
+        head, text, kind, pics = self._article(id, url, full)
         lines = textfmt.wrap(text, width)
         start = int(c) if c and c.isdigit() else 0
         out, size, i = [], 0, start
@@ -204,8 +214,29 @@ class Amifeed:
             out.append(lines[i])
             i += 1
         rows = [[k, textfmt.title(v) if k != "L" else textfmt.field(v, 1000)] for k, v in head.items()]
-        rows += [["X", kind], [""]] + [[ln] for ln in out]
+        rows += [["X", kind]]
+        if pics:
+            rows += [["I", str(len(pics))]]
+        rows += [[""]] + [[ln] for ln in out]
         return rows, (str(i) if i < len(lines) else None), len(out)
+
+    def image(self, id, n, url=None, full=False, w=320, h=240, kb=60):
+        """Picture n (1 based) of an article as sixel, with a status line in front."""
+        pics = self._article(id, url, full)[3]
+        if not 1 <= n <= len(pics):
+            raise ProtoError("NOTFOUND", "the article has %d pictures" % len(pics))
+        src = pics[n - 1]
+        key = "i:" + hashlib.sha1(("%s\n%d %d %d" % (src, w, h, kb)).encode("utf-8")).hexdigest()
+        out = self.cache.get(key)
+        if out is None:
+            r = safefetch.fetch(src, **self.image_fetch_opts)
+            try:
+                six, pw, ph = images.to_sixel(r.body, w, h, kb * 1024)
+            except images.ImageError as e:
+                raise safefetch.FetchError("UPSTREAM", str(e))
+            out = b"OK w=%d h=%d\n" % (pw, ph) + six
+            self.cache.put(key, out)
+        return out
 
     def _server_id(self, id):
         if _LOCAL.match(id):
@@ -253,7 +284,8 @@ def _need(q, name):
 
 
 def dispatch(app, method, path, q):
-    """Returns (rows, more, n). Raises ProtoError, GReaderError or FetchError."""
+    """Returns (rows, more, n), or bytes for /img. Raises ProtoError, GReaderError
+    or FetchError."""
     if method == "GET" and path == "/cats":
         return (*app.cats(), None)
     if method == "GET" and path == "/feeds":
@@ -272,6 +304,10 @@ def dispatch(app, method, path, q):
         return (*app.star(_need(q, "id"), _bool(q, "on")), None)
     if method == "POST" and path == "/subscribe":
         return (*app.subscribe(_need(q, "url"), q.get("cat")), None)
+    if method == "GET" and path == "/img":
+        return app.image(_need(q, "id"), _int(q, "n", 1, 1, 999), url=q.get("url"),
+                         full=_bool(q, "full"), w=_int(q, "w", 320, 16, 2000),
+                         h=_int(q, "h", 240, 16, 2000), kb=_int(q, "kb", 60, 4, 1000))
     raise ProtoError("BADREQ", "unknown request %s %s" % (method, path))
 
 
@@ -297,12 +333,17 @@ class Handler(BaseHTTPRequestHandler):
         log.info("%s %s", self.client_address[0], fmt % args)
 
     def _reply(self, text, charset, status=200):
-        body = textfmt.encode(text, charset)
-        if len(body) > BODY_MAX:  # should not happen; never send more than promised
-            body = textfmt.encode("ERR INTERNAL response too large\n", charset)
+        if isinstance(text, bytes):  # a picture from /img
+            body, ctype = text, "application/octet-stream"
+            if len(body) > IMAGE_BODY_MAX:
+                body = b"ERR INTERNAL response too large\n"
+        else:
+            body = textfmt.encode(text, charset)
+            if len(body) > BODY_MAX:  # should not happen; never send more than promised
+                body = textfmt.encode("ERR INTERNAL response too large\n", charset)
+            ctype = "text/plain; charset=%s" % ("iso-8859-1" if charset == "latin1" else "utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain; charset=%s"
-                         % ("iso-8859-1" if charset == "latin1" else "utf-8"))
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -323,8 +364,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply("ERR AUTH not allowed\n", charset, 403)
             if q.get("cs", "utf8") not in ("utf8", "latin1"):
                 raise ProtoError("BADREQ", "cs must be utf8 or latin1")
-            rows, more, n = dispatch(self.app, method, u.path, q)
-            text = render(rows, more, n)
+            res = dispatch(self.app, method, u.path, q)
+            text = res if isinstance(res, bytes) else render(*res)
         except (ProtoError, gr.GReaderError, safefetch.FetchError) as e:
             text = "ERR %s %s\n" % (e.code, textfmt.field(str(e), 200))
         except Exception:

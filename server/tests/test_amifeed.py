@@ -5,7 +5,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from amifeed import app, cache, config, safefetch, textfmt
+import io
+import re
+
+from PIL import Image
+
+from amifeed import app, cache, config, images, safefetch, textfmt
 from amifeed.localfeed import LocalFeeds
 
 from . import fakereader
@@ -30,6 +35,19 @@ def test_html_to_text_paragraphs_lists_and_scripts():
     html = ("<p>One <b>two</b></p><script>evil()</script><ul><li>a</li><li>b</li></ul>"
             "<p>three<br>four</p><img alt='cat'>")
     assert textfmt.html_to_text(html) == "One two\n\n* a\n* b\n\nthree\nfour\n\n[image: cat]"
+
+
+def test_html_to_text_numbers_pictures():
+    pics = []
+    html = ('<p>a<img src="/x.png" alt="Cat"></p><img src="data:image/png;base64,AA">'
+            '<img src="https://t.example/p.gif" width="1" height="1">'
+            '<p><img data-src="https://cdn.example/y.jpg"><img src="/x.png"></p>')
+    assert textfmt.html_to_text(html, pics, "https://example.com/post/1") == \
+        "a[image 1: Cat]\n\n[image]\n\n[image 2][image 1]"
+    assert pics == ["https://example.com/x.png", "https://cdn.example/y.jpg"]
+    pics = ["https://example.com/x.png"]
+    assert textfmt.md_images("![Dog](https://e.com/d.jpg)\n![](ftp://e.com/f)", pics) == \
+        "[image 2: Dog]\n[image]"
 
 
 def test_wrap_keeps_width_and_hanging_indent():
@@ -115,6 +133,13 @@ class _FeedServer(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/pic.png":
+            body = png(400, 300)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         type(self).hits += 1
         if self.headers.get("If-None-Match") == '"v1"':
             self.send_response(304)
@@ -280,3 +305,87 @@ def test_local_feed_ssrf_without_allow(proxy):
     call, _, _ = proxy
     app.Handler.app.local.fetch_opts["allow_private"] = False
     assert call("/list?url=http%3A%2F%2F127.0.0.1%2Ffeed").startswith(b"ERR BADREQ")
+
+
+# -- pictures ---------------------------------------------------------------
+
+def unsixel(data):
+    """A small sixel decoder: returns (w, h, {(x, y): (r, g, b)})."""
+    d = data.decode("ascii")
+    assert d.startswith("\x1bP0;1;0q") and d.endswith("\x1b\\")
+    m = re.match(r'"1;1;(\d+);(\d+)', d[8:])
+    w, h = int(m[1]), int(m[2])
+    d = d[8 + m.end():-2]
+    pal, px, x, y, col, i = {}, {}, 0, 0, None, 0
+    while i < len(d):
+        if d[i] == "#":
+            m = re.match(r"#(\d+)(?:;2;(\d+);(\d+);(\d+))?", d[i:])
+            i += m.end()
+            if m[2]:
+                pal[int(m[1])] = tuple(int(v) for v in m.groups()[1:])
+            col = pal[int(m[1])]
+            continue
+        if d[i] == "!":
+            m = re.match(r"!(\d+)([?-~])", d[i:])   # a count is always followed by a sixel
+            assert m, "bare repeat count at %d" % i
+            n, ch, i = int(m[1]), m[2], i + m.end()
+        else:
+            n, ch, i = 1, d[i], i + 1
+        if ch == "$":
+            x = 0
+            continue
+        if ch == "-":
+            x, y = 0, y + 6
+            continue
+        for _ in range(n):
+            for k in range(6):
+                if (ord(ch) - 63) >> k & 1:
+                    assert (x, y + k) not in px, "pixel painted twice"
+                    px[(x, y + k)] = col
+            x += 1
+    return w, h, px
+
+
+def test_sixel_round_trip():
+    pal = [0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]
+    w, h = 23, 13
+    pixels = bytes(((x // 4) + (y // 3)) % 4 if x < 20 else 0 for y in range(h) for x in range(w))
+    dw, dh, px = unsixel(images.encode(pixels, w, h, pal))
+    assert (dw, dh) == (w, h)
+    pct = {0: (0, 0, 0), 1: (100, 0, 0), 2: (0, 100, 0), 3: (0, 0, 100)}
+    assert px == {(x, y): pct[pixels[y * w + x]] for y in range(h) for x in range(w)}
+
+
+def png(w, h, mode="RGB"):
+    im = Image.new(mode, (w, h))
+    im.putdata([((x * 7) % 256, (y * 5) % 256, ((x + y) * 3) % 256) + ((128,) if mode == "RGBA" else ())
+                for y in range(h) for x in range(w)])
+    b = io.BytesIO()
+    im.save(b, "PNG")
+    return b.getvalue()
+
+
+def test_to_sixel_fits_size_and_budget():
+    six, w, h = images.to_sixel(png(400, 300), 200, 200, 1 << 20)
+    assert (w, h) == (200, 150) and unsixel(six)[:2] == (200, 150)
+    six, w, h = images.to_sixel(png(40, 30, "RGBA"), 320, 240, 1 << 20)
+    assert (w, h) == (40, 30)                          # never made bigger
+    six, w, h = images.to_sixel(png(400, 300), 400, 300, 8000)
+    assert len(six) <= 8000 and w < 400
+    with pytest.raises(images.ImageError):
+        images.to_sixel(b"<html>not a picture</html>", 100, 100, 10000)
+
+
+def test_item_and_img(proxy, tmp_path):
+    call, state, feed_url = proxy
+    pic = feed_url.replace("/feed.xml", "/pic.png")
+    state.items.append(fakereader.item(3, "Pics", '<p>Look:</p><img src="%s" alt="A">' % pic))
+    out = lines(call("/item?id=%016x" % 3))
+    assert "I\t1" in out and "[image 1: A]" in out
+    body = call("/img?id=%016x&n=1&w=64&h=64" % 3)
+    head, six = body.split(b"\n", 1)
+    assert head == b"OK w=64 h=48"
+    assert unsixel(six)[:2] == (64, 48)
+    assert call("/img?id=%016x&n=1&w=64&h=64" % 3) == body       # from the cache
+    assert call("/img?id=%016x&n=2" % 3).startswith(b"ERR NOTFOUND")
+    assert call("/img?id=%016x&n=1" % 1).startswith(b"ERR NOTFOUND")

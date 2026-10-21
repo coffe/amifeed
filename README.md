@@ -31,6 +31,9 @@ What you get:
 - Local feeds: feeds kept only on the client. The proxy fetches and parses
   them; which articles you have read is stored on the client.
 - UTF-8 or ISO-8859-1 text (the proxy transliterates what does not fit).
+- Pictures, in terminals that draw sixel graphics (UP-Term's XCON on the
+  Amiga; foot, WezTerm, Konsole, xterm -ti vt340 and others on Linux). See
+  [Pictures](#pictures).
 
 Tested with **FreshRSS 1.29**. Other servers with a Google Reader API
 (Miniflux, Inoreader, The Old Reader, ...) may work but have not been tried.
@@ -139,6 +142,23 @@ printf 'HOST=127.0.0.1\nPORT=8642\nTOKEN_FILE=token\n' > ~/.config/amifeed/clien
 `TOKEN=` works too. Local feeds and their read state live in the same folder
 (`feeds`, `seen`). The commands are the same as on the Amiga.
 
+## Pictures
+
+A picture in an article shows up in the text as `[image 1: alt text]`, and
+the bottom bar says how many there are (`i 3 pics`). Press `i` to see them,
+one at a time: `n`/`p` for the next and previous, any other key goes back.
+Nothing is fetched until you ask.
+
+The proxy fetches the picture, scales it to fit the window and turns it into
+sixel graphics with as few colours and pixels as it takes to stay under a
+size budget: 60 KB on the Amiga (about 3 s over a serial PPP link), 200 KB
+on Linux. Converted pictures are cached.
+
+The clients ask the terminal whether it draws sixel graphics (`ESC [ c`) and
+how big a character cell is (`ESC [ 16 t`). A terminal without sixel shows
+no `i` on the Amiga; the Linux client says so and points to `l`. On the
+Amiga, sixel needs UP-Term's XCON; a plain CON: window cannot draw pictures.
+
 ## Keys
 
 | Where | Key | |
@@ -159,6 +179,7 @@ printf 'HOST=127.0.0.1\nPORT=8642\nTOKEN_FILE=token\n' > ~/.config/amifeed/clien
 | | `n` `p` | next, previous article |
 | | `f` | fetch the whole article from the web |
 | | `l` | show the link |
+| | `i` | pictures (`n`/`p` next/previous, any other key back) |
 | | `u` | mark unread and go back |
 
 An article is marked read when you open it.

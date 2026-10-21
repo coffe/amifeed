@@ -51,6 +51,8 @@ in LF (`\n`, no CR).
   separators), DEL, C1 (0x80-0x9F, including the Amiga CSI 0x9B) and ESC
   sequences are removed from everything that comes from feeds or web pages.
   The proxy never sends terminal codes; colours are the client's business.
+  The one exception is `/img`, whose body after the status line is a sixel
+  picture, made by the proxy itself (see there).
 - Titles are cut to 200 characters (with `...` at the end).
 - A response body is at most 64 KiB. Longer article text continues with `more=`.
 
@@ -137,12 +139,41 @@ Header rows (before the empty line): `T` title, `F` feed, `D` date, `L` link,
 - `extracted` - the proxy fetched the web page and took out the main text
   (`full=1`, or a feed the proxy is told always to fetch).
 
+When the text has pictures there is one more header row, `I` and their number
+(`I<TAB>3`). In the text each picture is a line part like `[image 2: alt text]`
+(or `[image 2]`); fetch it with `/img?...&n=2`. The numbers depend on `full`:
+the extracted page can have other pictures than the feed. Pictures without a
+usable address stay `[image: alt text]` and are not counted.
+
 The text is wrapped to `w` columns; paragraphs are separated by one empty line.
 `n` counts the text lines in this response. When the text goes on, `more=`
 gives the cursor for the next part: ask again with `c=<cursor>` (the header rows
 come again).
 
 Asking for an article does not mark it read; the client does that with `/mark`.
+
+### `GET /img?id=<id>&n=<number>[&full=1][&w=<px>][&h=<px>][&kb=<KiB>]`
+Picture `n` (from 1) of an article, as sixel graphics (DEC VT340 / xterm), for
+a terminal that can show them. For a local article also pass `&url=`, and pass
+`full=1` when the numbers came from a `full=1` article.
+
+The proxy fetches the picture, scales it down to fit `w` x `h` pixels (default
+320 x 240; it is never made bigger), and lowers the number of colours (64, 32,
+16, 8) and then the size until it fits in `kb` KiB (default 60, 4-1000). The
+answer is one status line and the picture:
+
+```
+OK w=304 h=240
+<ESC>P0;1;0q"1;1;304;240#0;2;...<ESC>\
+```
+
+Write the bytes after the first LF to the terminal as they are, where the
+picture should go. They are 7-bit ASCII from ESC P to ESC \ and nothing else;
+the DCS uses P2=1 (zero bits leave the screen alone), which some terminals
+(UP-Term's XCON) need. `cs` has no meaning here, and the body may be bigger
+than 64 KiB when `kb` asks for it. Errors are ordinary `ERR` lines
+(`NOTFOUND` for a number the article does not have, `UPSTREAM` for a picture
+that cannot be fetched or read). Results are cached.
 
 ### `POST /mark?id=<id>&read=0|1`
 ### `POST /star?id=<id>&on=0|1`

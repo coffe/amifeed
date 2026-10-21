@@ -9,3 +9,4 @@ amiga/build/
 amiga/amifeed
 amiga/test/nettest
 server/.env
+amiga/test/pxtest

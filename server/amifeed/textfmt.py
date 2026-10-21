@@ -4,6 +4,7 @@ import html
 import re
 import textwrap
 import unicodedata
+import urllib.parse
 from html.parser import HTMLParser
 
 TITLE_MAX = 200
@@ -47,11 +48,12 @@ class _TextParser(HTMLParser):
              "h4", "h5", "h6", "hr"}
     SKIP = {"script", "style", "noscript", "template", "svg", "head", "iframe"}
 
-    def __init__(self):
+    def __init__(self, images=None, base=""):
         super().__init__(convert_charrefs=True)
         self.out = []
         self.skip = 0
         self.pre = 0
+        self.images, self.base = images, base
 
     def _para(self):
         self.out.append("\n\n")
@@ -68,8 +70,15 @@ class _TextParser(HTMLParser):
         elif tag in ("td", "th"):
             self.out.append("  ")
         elif tag == "img":
-            alt = dict(attrs).get("alt") or ""
-            self.out.append("[image: %s]" % alt.strip() if alt.strip() else "[image]")
+            a = dict(attrs)
+            alt = (a.get("alt") or "").strip()
+            src = image_url(a.get("src") or a.get("data-src") or a.get("data-lazy-src"), self.base)
+            if src and a.get("width") in ("0", "1") and a.get("height") in ("0", "1"):
+                return  # a tracking pixel
+            if src and self.images is not None:
+                self.out.append(placeholder(self.images, src, alt))
+            else:
+                self.out.append("[image: %s]" % alt if alt else "[image]")
         elif tag in self.BLOCK:
             self._para()
             if tag == "pre":
@@ -91,13 +100,44 @@ class _TextParser(HTMLParser):
         self.out.append(data)
 
 
-def html_to_text(s):
-    """Feed HTML (or plain text) to paragraphs separated by one empty line."""
+def image_url(src, base=""):
+    """An http(s) address for an <img src>, or None (data: and the like)."""
+    src = (src or "").strip()
+    if not src or src.startswith("data:"):
+        return None
+    src = urllib.parse.urljoin(base, src)
+    return src if urllib.parse.urlsplit(src).scheme in ("http", "https") else None
+
+
+def placeholder(images, src, alt):
+    """Add a picture to images (once) and give its line in the text."""
+    if src not in images:
+        images.append(src)
+    n = images.index(src) + 1
+    alt = field(alt, 100)
+    return "[image %d: %s]" % (n, alt) if alt else "[image %d]" % n
+
+
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+
+
+def md_images(text, images, base=""):
+    """trafilatura writes pictures as ![alt](url): turn them into placeholders."""
+    def one(m):
+        src = image_url(m[2], base)
+        return placeholder(images, src, m[1]) if src else ("[image: %s]" % m[1] if m[1] else "[image]")
+    return _MD_IMAGE.sub(one, text)
+
+
+def html_to_text(s, images=None, base=""):
+    """Feed HTML (or plain text) to paragraphs separated by one empty line.
+    With a list in images, pictures get numbered placeholders ("[image 2: alt]")
+    and their addresses are added to the list."""
     if not s:
         return ""
     if "<" not in s:
         s = html.escape(s).replace("\n\n", "<p>").replace("\n", "<br>")
-    p = _TextParser()
+    p = _TextParser(images, base)
     p.feed(s)
     p.close()
     text = clean("".join(p.out).replace("\t", "    ").replace("\r", ""))

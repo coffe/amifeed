@@ -14,6 +14,7 @@ live in the same folder, in "feeds" and "seen".
 """
 import http.client
 import os
+import re
 import select
 import shutil
 import sys
@@ -133,17 +134,22 @@ class Proxy:
         self.port = int(cfg["PORT"])
         self.token = cfg["TOKEN"]
 
-    def request(self, method, path, **params):
-        """Returns (more, rows); raises Error with the proxy's message."""
+    def raw(self, method, path, **params):
+        """The answer's bytes, as they came."""
         q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
         try:
             c = http.client.HTTPConnection(self.host, self.port, timeout=40)
             c.request(method, path + ("?" + q if q else ""),
                       headers={"X-Token": self.token, "Connection": "close"})
-            body = c.getresponse().read().decode("utf-8", "replace")
+            body = c.getresponse().read()
             c.close()
         except (OSError, http.client.HTTPException) as e:
             raise Error("cannot reach %s:%d (%s)" % (self.host, self.port, e))
+        return body
+
+    def request(self, method, path, **params):
+        """Returns (more, rows); raises Error with the proxy's message."""
+        body = self.raw(method, path, **params).decode("utf-8", "replace")
         lines = body.split("\n")
         head = lines[0]
         if head.startswith("ERR "):
@@ -192,13 +198,37 @@ class Term:
         self.fixed = (int(cfg["HEIGHT"] or 0), int(cfg["WIDTH"] or 0))
         self.buf = []
         self.rows, self.cols = 24, 80
+        self.sixel, self.cell = False, (16, 8)      # (height, width) in pixels
         self.size()
 
     def __enter__(self):
         self.old = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
+        self.query_graphics()
         self.w("\x1b[?1049h\x1b[?25l")
         return self
+
+    def ask(self, q, final):
+        """The terminal's answer to q (up to the final character), or ""."""
+        os.write(sys.stdout.fileno(), q.encode())
+        out = ""
+        while True:
+            c = self._byte(0.5)
+            if c is None:
+                return ""
+            out += chr(c)
+            if chr(c) == final:
+                return out
+
+    def query_graphics(self):
+        """Does the terminal draw sixel pictures, and how big is a cell?"""
+        da = self.ask("\x1b[c", "c")
+        self.sixel = "4" in da.lstrip("\x1b[?").rstrip("c").split(";")
+        if not self.sixel:
+            return
+        m = re.match(r"\x1b\[6;(\d+);(\d+)t", self.ask("\x1b[16t", "t"))
+        if m and int(m[1]) and int(m[2]):
+            self.cell = (int(m[1]), int(m[2]))
 
     def __exit__(self, *exc):
         self.w("\x1b[0m\x1b[?25h\x1b[?1049l")
@@ -294,7 +324,7 @@ class App:
     def bar(self, y, left, right):
         cols = self.t.cols
         self.t.goto(y)
-        self.t.w(C_BAR + " " + cut(left, max(cols - cols_of(right) - 3, 0)) + right + " " + C_OFF)
+        self.t.w(C_BAR + " " + cut(left, max(cols - cols_of(right) - 4, 0)) + " " + right + " " + C_OFF)
 
     def status(self, colour, msg):
         self.t.goto(self.t.rows)
@@ -387,7 +417,7 @@ class App:
         more, rows = self.p.request("GET", "/item", id=a["id"], w=self.t.cols - 1,
                                     full=1 if full else None, url=url, c=cursor)
         if not cursor:
-            item.update(lines=[], kind="", link="", feed="", date="")
+            item.update(lines=[], kind="", link="", feed="", date="", pics=0)
         item["more"] = more
         body = False
         for r in rows:
@@ -400,6 +430,8 @@ class App:
             k, _, v = r.partition("\t")
             if k == "T" and not cursor:
                 a["title"] = v
+            elif k == "I":
+                item["pics"] = int(v) if v.isdigit() else 0
             elif k in ("X", "L", "F", "D"):
                 item[{"X": "kind", "L": "link", "F": "feed", "D": "date"}[k]] = v
 
@@ -439,10 +471,12 @@ class App:
                 self.t.w(cut(lines[top + i], self.t.cols - 1))
             n = len(lines)
             right = "%d%%" % ((min(top + h, n) * 100 // n) if n else 100)
+            n_pics = item["pics"]
+            pics = "i %d pic%s  " % (n_pics, "s" if n_pics > 1 else "") if n_pics else ""
             if item["kind"] == "excerpt":
-                self.bar(self.t.rows, "Excerpt only - f: whole article  spc/b page  n/p next/prev  s star  q back", right)
+                self.bar(self.t.rows, "Excerpt - f: whole  %sspc/b page  n/p next/prev  s star  q back" % pics, right)
             else:
-                self.bar(self.t.rows, "spc/b page  n/p next/prev  s star  u unread  l link  f full  q back", right)
+                self.bar(self.t.rows, "spc/b page  n/p next/prev  %ss star  u unread  l link  f full  q back" % pics, right)
             k = self.t.key()
             if k in ("QUIT", "q", "LEFT", "ESC"):
                 return 0
@@ -472,6 +506,12 @@ class App:
             elif k == "l":
                 self.status(C_OFF, item["link"] + "  (any key)")
                 self.t.key()
+            elif k == "i" and item["pics"]:
+                if self.t.sixel:
+                    self.show_pictures(a, url, full, item["pics"])
+                else:
+                    self.status(C_OFF, "This terminal draws no sixel pictures - l shows the link  (any key)")
+                    self.t.key()
             elif k == "f":
                 top, full = 0, True
                 try:
@@ -483,6 +523,42 @@ class App:
                         self.load_item(a, url, False, item)
                     except Error:
                         pass
+
+    def show_pictures(self, a, url, full, count):
+        """The article's pictures, one at a time, as big as the window allows."""
+        n = 1
+        ch, cw = self.t.cell
+        while True:
+            self.clear()
+            self.bar(1, a["title"], "")
+            self.status(C_DIM, "Loading the picture...")
+            self.t.flush()
+            try:
+                body = self.p.raw("GET", "/img", id=a["id"], n=n, w=(self.t.cols - 1) * cw,
+                                  h=(self.t.rows - 3) * ch, kb=200, full=1 if full else None, url=url)
+                head, _, six = body.partition(b"\n")
+                if head.startswith(b"ERR "):
+                    raise Error(head[4:].decode("utf-8", "replace"))
+                if not head.startswith(b"OK "):
+                    raise Error("unexpected answer from the proxy")
+                size = head[3:].decode().replace("w=", "").replace(" h=", "x")
+                self.t.goto(2)
+                self.t.flush()
+                os.write(sys.stdout.fileno(), six)
+                self.bar(self.t.rows, "n/p next/prev picture  q back" if count > 1 else "q back",
+                         "%d/%d %s" % (n, count, size))
+                k = self.t.key()
+            except Error as e:
+                k = self.fail("No picture", e)
+            # keys that would not change the picture do nothing
+            while k in ("n", " ", "RIGHT") and n >= count:
+                k = self.t.key()
+            if k in ("n", " ", "RIGHT"):
+                n += 1
+            elif k in ("p", "b", "LEFT") and n > 1:
+                n -= 1
+            else:
+                return
 
     # the article list
 
