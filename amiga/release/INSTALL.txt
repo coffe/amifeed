@@ -1,0 +1,12 @@
+amifeed 1.0 for AmigaOS 3.x (68020 or better, bsdsocket.library)
+
+1. Copy amifeed to C: (or anywhere in your path).
+2. MakeDir ENVARC:amifeed
+   Copy config.example ENVARC:amifeed/config
+   and edit HOST, PORT and TOKEN to match your amifeed proxy.
+3. Copy ENVARC:amifeed ENV:amifeed ALL  (or reboot)
+4. Double-click the amifeed icon, or run amifeed in a Shell or UP-Term
+   window (UP-Term can show pictures, a plain window cannot).
+
+The proxy runs on Linux, see README.txt or https://github.com/coffe/amifeed
+License: GPL-3.0-or-later, see LICENSE.txt

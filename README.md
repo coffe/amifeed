@@ -106,6 +106,9 @@ cd amiga
 make
 ```
 
+`amiga/release/release.sh` builds the release archive (binary, Workbench
+icons and docs).
+
 Copy `amifeed` to the Amiga, for example to `C:`, and create
 `ENVARC:amifeed/config`:
 
@@ -119,7 +122,8 @@ Optional keys: `WIDTH=` and `HEIGHT=` if the console does not report its
 size, and `CHARSET=latin1` for consoles without UTF-8 (UP-Term is UTF-8; a
 plain CON: window wants latin1).
 
-Start `amifeed` in a console window. For scripts:
+Start `amifeed` in a console window, or double-click its icon (it then
+opens a window of its own). For scripts:
 
 ```
 amifeed list [stream]       categories, or the unread articles of a stream

@@ -20,7 +20,7 @@ static void usage(void)
 	       "Settings: ENVARC:amifeed/config (HOST=, PORT=, TOKEN=, WIDTH=, HEIGHT=, CHARSET=)\n");
 }
 
-int main(int argc, char **argv)
+static int run(int argc, char **argv)
 {
 	int rc;
 
@@ -55,5 +55,29 @@ int main(int argc, char **argv)
 	}
 	save_seen(0);
 	net_close();
+	return rc;
+}
+
+int main(int argc, char **argv)
+{
+	BPTR con, oldin, oldout;
+	int rc;
+
+	if (argc != 0)
+		return run(argc, argv);
+	/* argc 0 = started from Workbench: there is no console, so open one */
+	if (!(con = Open("CON:0/12/640/240/amifeed/CLOSE", MODE_OLDFILE)))
+		return RETURN_FAIL;
+	oldin = SelectInput(con);
+	oldout = SelectOutput(con);
+	rc = run(1, argv);
+	if (rc >= RETURN_FAIL) {  /* keep the error on screen */
+		char c;
+		PutStr("Press Return to close.\n");
+		Read(con, &c, 1);
+	}
+	SelectInput(oldin);
+	SelectOutput(oldout);
+	Close(con);
 	return rc;
 }
