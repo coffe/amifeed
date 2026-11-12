@@ -7,7 +7,7 @@
 
 #include <exec/types.h>
 
-#define VERSION_STR  "0.1"
+#define VERSION_STR  "1.0"
 #define ID_MAX       16          /* ids are at most 16 characters (PROTOCOL.md) */
 #define RESP_MAX     (68 * 1024) /* a response body is at most 64 KiB, plus the HTTP header */
 #define ROWS_MAX     200

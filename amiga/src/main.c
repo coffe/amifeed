@@ -7,7 +7,7 @@
 
 #include "amifeed.h"
 
-const char version[] = "$VER: amifeed " VERSION_STR " (20.10.2026)";
+const char version[] = "$VER: amifeed " VERSION_STR " (12.11.2026)";
 
 static void usage(void)
 {

@@ -97,7 +97,8 @@ Needs AmigaOS 3.0 or newer, a 68020 or better, and a running TCP/IP stack
 with `bsdsocket.library` (Roadshow, AmiTCP, Miami). It uses about 600 KB
 of memory.
 
-Build it with the [vbcc Docker image](https://github.com/walkero-gr/docker4AmigaVBCC)
+A prebuilt binary is on the [releases page](https://github.com/coffe/amifeed/releases/latest)
+(`amifeed-1.0.lha`, with an `INSTALL.txt`). Or build it with the [vbcc Docker image](https://github.com/walkero-gr/docker4AmigaVBCC)
 (it has the NDK and the Roadshow SDK):
 
 ```sh
