@@ -7,7 +7,7 @@ name = "amifeed"
 version = "0.1.0"
 description = "A plain text RSS proxy for retro computers (Google Reader API / FreshRSS)"
 readme = "../README.md"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11"
 dependencies = ["feedparser>=6", "trafilatura>=1.6", "pillow>=10"]
 
